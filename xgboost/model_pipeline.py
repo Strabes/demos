@@ -1,3 +1,4 @@
+import warnings
 from typing import Union
 import re
 import pandas as pd
@@ -96,10 +97,13 @@ def name_tracker(p, X, numeric_preds, object_preds):
 
     # Indicators for Missing Numeric Columns
     nni = p['col_transformers'].transformers_[0][1]['num_nan_ind']
-    nan_num_ind = pd.DataFrame({
-        "cols":[i+"_na" for i in nni.variables_],
-        "cols_in":nni.variables_})
-    df = pd.concat([df, nan_num_ind])
+    try:
+        nan_num_ind = pd.DataFrame({
+            "cols":[i+"_na" for i in nni.variables_],
+            "cols_in":nni.variables_})
+        df = pd.concat([df, nan_num_ind])
+    except:
+        pass
 
     # Onehot encoding of categorical columns
     one = p['col_transformers'].transformers_[1][1]['one_hot_encoder']
@@ -110,16 +114,21 @@ def name_tracker(p, X, numeric_preds, object_preds):
     df = pd.concat([df,one_hot_encoder])
 
     # Put everythin together
-    final_num_cols = (p["col_transformers"]
-        .transformers_[0][1]
-        .transform(X.head(1)[numeric_preds])
-        .columns.tolist())
+    if len(numeric_preds) > 0:
+        final_num_cols = (p["col_transformers"]
+            .transformers_[0][1]
+            .transform(X.head(1)[numeric_preds])
+            .columns.tolist())
+    else:
+        final_num_cols = []
 
-    
-    final_obj_cols = (p["col_transformers"]
-        .transformers_[1][1]
-        .transform(X.head(1)[object_preds])
-        .columns.tolist())
+    if len(object_preds) > 0:
+        final_obj_cols = (p["col_transformers"]
+            .transformers_[1][1]
+            .transform(X.head(1)[object_preds])
+            .columns.tolist())
+    else:
+        final_obj_cols = []
 
     df_ = pd.DataFrame({"final_cols": final_num_cols + final_obj_cols})
 
@@ -168,7 +177,7 @@ def rename(df):
 
 
 class RFE:
-    def __init__(self,p):
+    def __init__(self):
         self.rfe_results = []
 
     @staticmethod
@@ -180,7 +189,7 @@ class RFE:
         return p
 
     @staticmethod
-    def _var_imp(p, X, numeric_pred, object_preds):
+    def _var_imp(p, X, numeric_preds, object_preds):
         fe = feature_importances(p, X, numeric_preds, object_preds)
         var_imp = (fe.groupby("cols_in")[["feature_importances"]]
             .sum().sort_values("feature_importances",ascending=False)
@@ -191,26 +200,54 @@ class RFE:
     def rfe_schedule(curr_features):
         n_features = len(curr_features)
         if n_features > 100:
-            updated_features = curr_features[:100]
+            vars_to_keep = curr_features[:100]
         elif n_features > 50:
-            updated_features = curr_features[:(n_features-10)]
+            vars_to_keep = curr_features[:(n_features-10)]
         elif n_features > 20:
-            updated_features = curr_features[:(n_features-5)]
+            vars_to_keep = curr_features[:(n_features-5)]
         elif n_features > 10:
-            updated_features = curr_features[:(n_features-2)]
+            vars_to_keep = curr_features[:(n_features-2)]
         elif n_features > 1:
-            updated_features = curr_features[:(n_features-1)]
-        return updated_features
+            vars_to_keep = curr_features[:(n_features-1)]
+        else:
+            vars_to_keep = []
+        return vars_to_keep
 
     @staticmethod
     def get_eval_metric(p,X,y):
         z = pd.DataFrame(
                 p.predict_proba(X),
                 columns=['prob1','prob2'])
-        roc_auc = metrics.roc_auc_score(1 - le.fit_transform(y), z.prob1.values)
+        roc_auc = metrics.roc_auc_score(1 - y, z.prob1.values)
         return roc_auc
 
-    def run_rfe(self,X_train,y_train,X_val,y_val,numeric_preds,object_preds):
-        while len(numeric_preds + object_preds) > 0:
-            p = self._run_single_fit(X_train,y_train,numeric_preds,object_preds)
-            updated_vars = None
+    def update_preds(self, p, X, numeric_preds, object_preds):
+        var_imp = self._var_imp(p, X, numeric_preds, object_preds)
+        vars_to_keep = self.rfe_schedule(var_imp)
+        numeric_preds = [v for v in numeric_preds if v in vars_to_keep]
+        object_preds = [v for v in object_preds if v in vars_to_keep]
+        return numeric_preds, object_preds
+
+
+    def run_rfe(self,X_train,y_train,X_val,y_val,numeric_preds,object_preds, supp_warnings = True):
+        curr_preds = numeric_preds + object_preds
+        while len(curr_preds) > 0:
+            print("Fitting model with {} features".format(len(curr_preds)))
+            #print("numeric_preds length = {}".format(len(numeric_preds)))
+            #print("object_preds length = {}".format(len(object_preds)))
+            if supp_warnings:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    p = self._run_single_fit(X_train,y_train,numeric_preds,object_preds)
+            else:
+                p = self._run_single_fit(X_train,y_train,numeric_preds,object_preds)
+            eval_metric = self.get_eval_metric(p,X_val[curr_preds],y_val)
+            numeric_preds, object_preds = self.update_preds(
+                p, X_val[curr_preds].head(),numeric_preds, object_preds)
+            preds_to_drop = [v for v in curr_preds if v not in numeric_preds + object_preds]
+            self.rfe_results.append(
+                {"n_features":len(curr_preds),
+                 "preds_to_drop":preds_to_drop,
+                 "eval_metric":eval_metric,
+                 "vars_to_keep" : numeric_preds + object_preds})
+            curr_preds = numeric_preds + object_preds
