@@ -208,8 +208,9 @@ class RFE:
                 p.predict_proba(X),
                 columns=['prob1','prob2'])
         roc_auc = metrics.roc_auc_score(1 - le.fit_transform(y), z.prob1.values)
+        return roc_auc
 
     def run_rfe(self,X_train,y_train,X_val,y_val,numeric_preds,object_preds):
         while len(numeric_preds + object_preds) > 0:
             p = self._run_single_fit(X_train,y_train,numeric_preds,object_preds)
-            updated_vars = 
+            updated_vars = None
