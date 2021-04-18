@@ -20,8 +20,11 @@ def str_cleaner(s):
     else:
         raise(TypeError("Found element of type " + type(s)))
 
-def str_cleaner_df(df,variables):
+def str_cleaner_df(df,variables = None):
     if isinstance(variables,str): variables = [variables]
+    elif variables is None:
+        variables = [k for k,v in df.dtypes.to_dict().items()
+            if pd.api.types.is_object_dtype(v)]
     df.copy()
     df.loc[:,variables] = df.loc[:,variables].applymap(str_cleaner)
     return(df)
