@@ -2,8 +2,9 @@ import warnings
 from typing import Union
 import re
 import pandas as pd
+import numpy as np
 from sklearn.pipeline import Pipeline
-from sklearn.compose import ColumnTransformer
+from sklearn.compose import ColumnTransformer, make_column_selector
 from sklearn import metrics
 from feature_engine.imputation import (
     CategoricalImputer,
@@ -15,17 +16,14 @@ from xgboost.sklearn import XGBClassifier
 from utils import str_cleaner_df
 
 
-def create_pipeline(numeric_preds, object_preds):
+def create_pipeline(params : dict = None):
     """
     Create sklearn.pipeline.Pipeline
 
     Parameters
     ----------
-    numeric_preds : Union[str, list]
-        columns name(s) of numeric predictor(s)
-
-    object_preds : Union[str, list]
-        columns name(s) of object predictor(s)
+    params : dict
+        dictionary of parameters for the pipeline
 
     Returns
     -------
@@ -48,8 +46,8 @@ def create_pipeline(numeric_preds, object_preds):
 
     # list of pipelines to combine
     transformers = [
-        ("num",p_num,numeric_preds),
-        ("cat",p_cat,object_preds)
+        ("num",p_num,make_column_selector(dtype_include = np.number)),
+        ("cat",p_cat,make_column_selector(dtype_include = object))
     ]
 
     # combine pipelines and add XGBClassifier
@@ -60,10 +58,12 @@ def create_pipeline(numeric_preds, object_preds):
         nthread=4, scale_pos_weight=1, seed=1, gpu_id=0, tree_method = 'gpu_hist'))
     ])
 
+    if params:
+        p.set_params(**params)
     return p
 
 
-def name_tracker(p, X, numeric_preds, object_preds):
+def name_tracker(p, X):
     """
     Track names through pipeline. This function is
     specific to the architecture of the given pipeline.
@@ -80,12 +80,6 @@ def name_tracker(p, X, numeric_preds, object_preds):
 
     X : pandas.DataFrame
         the input to the pipeline
-
-    numeric_preds : list
-        column names of numeric predictor inputs to the pipeline
-
-    object_preds : list
-        column names of object predictor inputs to the pipeline
 
     Returns
     -------
@@ -113,15 +107,18 @@ def name_tracker(p, X, numeric_preds, object_preds):
         columns = ["cols","cols_in"])
     df = pd.concat([df,one_hot_encoder])
 
-    # Put everythin together
+    # Put everything together
+    numeric_preds = p['col_transformers'].transformers_[0][2]
     if len(numeric_preds) > 0:
         final_num_cols = (p["col_transformers"]
             .transformers_[0][1]
-            .transform(X.head(1)[numeric_preds])
+            .transform(
+                X.head(1)[numeric_preds])
             .columns.tolist())
     else:
         final_num_cols = []
 
+    object_preds = p['col_transformers'].transformers_[1][2]
     if len(object_preds) > 0:
         final_obj_cols = (p["col_transformers"]
             .transformers_[1][1]
@@ -132,12 +129,13 @@ def name_tracker(p, X, numeric_preds, object_preds):
 
     df_ = pd.DataFrame({"final_cols": final_num_cols + final_obj_cols})
 
-    df = pd.merge(df_,df,left_on="final_cols",right_on="cols").loc[:,["final_cols","cols_in"]]
+    df = (pd.merge(df_,df,left_on="final_cols",right_on="cols")
+            .loc[:,["final_cols","cols_in"]])
 
     return df
 
 
-def feature_importances(p, X, numeric_preds, object_preds):
+def feature_importances(p, X):
     """
     Get feature_importances in a pandas.DataFrame
 
@@ -147,16 +145,12 @@ def feature_importances(p, X, numeric_preds, object_preds):
 
     X : pandas.DataFrame
 
-    numeric_preds : list
-
-    object_preds : list
-
     Returns
     -------
     pandas.DataFrame
     """
     feature_importances_ = p.steps[-1][1].feature_importances_
-    df = name_tracker(p, X, numeric_preds, object_preds)
+    df = name_tracker(p, X)
     df["feature_importances"] = feature_importances_
     return df
 
@@ -177,20 +171,21 @@ def rename(df):
 
 
 class RFE:
-    def __init__(self):
+    def __init__(self, params = None):
         self.rfe_results = []
+        self.params = params
 
-    @staticmethod
-    def _run_single_fit(X,y,numeric_preds,object_preds):
-        p = create_pipeline(numeric_preds,object_preds)
-        X = X.copy(deep=True)
-        X = X[numeric_preds + object_preds]
+    def _run_single_fit(self,X,y):
+        if self.params:
+            p = create_pipeline(self.params)
+        else:
+            p = create_pipeline()
         p.fit(X,y)
         return p
 
     @staticmethod
-    def _var_imp(p, X, numeric_preds, object_preds):
-        fe = feature_importances(p, X, numeric_preds, object_preds)
+    def _var_imp(p, X):
+        fe = feature_importances(p, X)
         var_imp = (fe.groupby("cols_in")[["feature_importances"]]
             .sum().sort_values("feature_importances",ascending=False)
             .index.tolist())
@@ -221,16 +216,14 @@ class RFE:
         roc_auc = metrics.roc_auc_score(1 - y, z.prob1.values)
         return roc_auc
 
-    def update_preds(self, p, X, numeric_preds, object_preds):
-        var_imp = self._var_imp(p, X, numeric_preds, object_preds)
+    def update_preds(self, p, X):
+        var_imp = self._var_imp(p, X)
         vars_to_keep = self.rfe_schedule(var_imp)
-        numeric_preds = [v for v in numeric_preds if v in vars_to_keep]
-        object_preds = [v for v in object_preds if v in vars_to_keep]
-        return numeric_preds, object_preds
+        return vars_to_keep
 
 
-    def run_rfe(self,X_train,y_train,X_val,y_val,numeric_preds,object_preds, supp_warnings = True):
-        curr_preds = numeric_preds + object_preds
+    def run_rfe(self,X_train,y_train,X_val,y_val, supp_warnings = True):
+        curr_preds = X_train.columns.tolist()
         while len(curr_preds) > 0:
             print("Fitting model with {} features".format(len(curr_preds)))
             #print("numeric_preds length = {}".format(len(numeric_preds)))
@@ -238,16 +231,17 @@ class RFE:
             if supp_warnings:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
-                    p = self._run_single_fit(X_train,y_train,numeric_preds,object_preds)
+                    p = self._run_single_fit(X_train,y_train)
             else:
-                p = self._run_single_fit(X_train,y_train,numeric_preds,object_preds)
-            eval_metric = self.get_eval_metric(p,X_val[curr_preds],y_val)
-            numeric_preds, object_preds = self.update_preds(
-                p, X_val[curr_preds].head(),numeric_preds, object_preds)
-            preds_to_drop = [v for v in curr_preds if v not in numeric_preds + object_preds]
+                p = self._run_single_fit(X_train,y_train)
+            eval_metric = self.get_eval_metric(p,X_val,y_val)
+            vars_to_keep = self.update_preds(p, X_val.head())
+            preds_to_drop = [v for v in curr_preds if v not in vars_to_keep]
             self.rfe_results.append(
                 {"n_features":len(curr_preds),
                  "preds_to_drop":preds_to_drop,
                  "eval_metric":eval_metric,
-                 "vars_to_keep" : numeric_preds + object_preds})
-            curr_preds = numeric_preds + object_preds
+                 "vars_to_keep" : vars_to_keep})
+            curr_preds = vars_to_keep
+            X_train = X_train.copy().loc[:,curr_preds]
+            X_val = X_val.copy().loc[:,curr_preds]
